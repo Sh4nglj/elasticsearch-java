@@ -91,6 +91,7 @@ public final class Rest5ClientBuilder {
     private boolean strictDeprecationMode = false;
     private boolean compressionEnabled = false;
     private boolean metaHeaderEnabled = true;
+    private RequestRoutingStrategy routingStrategy = null;
 
     static {
         // Never fail on unknown version, even if an environment messed up their classpath enough that we
@@ -326,6 +327,17 @@ public final class Rest5ClientBuilder {
     }
 
     /**
+     * Sets the {@link RequestRoutingStrategy} to be used for all requests.
+     *
+     * @throws NullPointerException if the provided routingStrategy is null
+     */
+    public Rest5ClientBuilder setRoutingStrategy(RequestRoutingStrategy routingStrategy) {
+        Objects.requireNonNull(routingStrategy, "routingStrategy must not be null");
+        this.routingStrategy = routingStrategy;
+        return this;
+    }
+
+    /**
      * Allows to customize the {@link CloseableHttpAsyncClient} being created and used by the
      * {@link Rest5Client}.
      * Commonly used to customize {@link HttpAsyncClientBuilder} without losing any other useful default
@@ -394,7 +406,8 @@ public final class Rest5ClientBuilder {
             nodeSelector,
             strictDeprecationMode,
             compressionEnabled,
-            metaHeaderEnabled
+            metaHeaderEnabled,
+            routingStrategy
         );
         httpClient.start();
         return restClient;

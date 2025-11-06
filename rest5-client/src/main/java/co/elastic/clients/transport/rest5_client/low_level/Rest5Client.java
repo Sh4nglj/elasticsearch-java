@@ -127,6 +127,7 @@ public class Rest5Client implements Closeable {
     private final WarningsHandler warningsHandler;
     private final boolean compressionEnabled;
     private final boolean metaHeaderEnabled;
+    private volatile RequestRoutingStrategy routingStrategy;
 
     Rest5Client(
         CloseableHttpAsyncClient client,
@@ -137,7 +138,8 @@ public class Rest5Client implements Closeable {
         NodeSelector nodeSelector,
         boolean strictDeprecationMode,
         boolean compressionEnabled,
-        boolean metaHeaderEnabled
+        boolean metaHeaderEnabled,
+        RequestRoutingStrategy routingStrategy
     ) {
         this.client = client;
         this.defaultHeaders = Collections.unmodifiableList(Arrays.asList(defaultHeaders));
@@ -147,6 +149,7 @@ public class Rest5Client implements Closeable {
         this.warningsHandler = strictDeprecationMode ? WarningsHandler.STRICT : WarningsHandler.PERMISSIVE;
         this.compressionEnabled = compressionEnabled;
         this.metaHeaderEnabled = metaHeaderEnabled;
+        this.routingStrategy = routingStrategy != null ? routingStrategy : new RoundRobinRoutingStrategy();
         setNodes(nodes);
     }
 
@@ -293,18 +296,20 @@ public class Rest5Client implements Closeable {
         return performRequest(nextNodes(), internalRequest, null);
     }
 
-    private Response performRequest(final Iterator<Node> nodes, final InternalRequest request,
+    private Response performRequest(final Iterator<Node> nodes, final InternalRequest request, 
                                     Exception previousException)
         throws IOException {
         RequestContext context = request.createContextForNextAttempt(nodes.next());
         ClassicHttpResponse httpResponse;
+        long startTimeNanos = System.nanoTime();
         try {
             httpResponse = client.execute(context.requestProducer,
                 context.asyncResponseConsumer,
                 context.context, null).get();
         } catch (Exception e) {
+            long responseTimeNanos = System.nanoTime() - startTimeNanos;
             RequestLogger.logFailedRequest(logger, request.httpRequest, context.node, e);
-            onFailure(context.node);
+            onFailure(context.node, responseTimeNanos, e);
             Exception cause = extractAndWrapCause(e);
             addSuppressedException(previousException, cause);
             if (isRetryableException(e) && nodes.hasNext()) {
@@ -319,8 +324,9 @@ public class Rest5Client implements Closeable {
             throw new IllegalStateException("unexpected exception type: must be either RuntimeException or " +
                 "IOException", cause);
         }
+        long responseTimeNanos = System.nanoTime() - startTimeNanos;
         ResponseOrResponseException responseOrResponseException = convertResponse(request, context.node,
-            httpResponse);
+            httpResponse, responseTimeNanos);
         if (responseOrResponseException.responseException == null) {
             return responseOrResponseException.response;
         }
@@ -332,7 +338,7 @@ public class Rest5Client implements Closeable {
     }
 
     private ResponseOrResponseException convertResponse(InternalRequest request, Node node,
-                                                        ClassicHttpResponse httpResponse) throws IOException {
+                                                        ClassicHttpResponse httpResponse, long responseTimeNanos) throws IOException {
         RequestLogger.logResponse(logger, request.httpRequest, node.getHost(), httpResponse);
         int statusCode = httpResponse.getCode();
 
@@ -354,7 +360,7 @@ public class Rest5Client implements Closeable {
 
         Response response = new Response(new RequestLine(request.httpRequest), node.getHost(), httpResponse);
         if (isCorrectServerResponse(statusCode)) {
-            onResponse(node);
+            onResponse(node, responseTimeNanos, statusCode);
             if (request.warningsHandler.warningsShouldFailRequest(response.getWarnings())) {
                 throw new WarningFailureException(response);
             }
@@ -363,11 +369,11 @@ public class Rest5Client implements Closeable {
         ResponseException responseException = new ResponseException(response);
         if (isRetryStatus(statusCode)) {
             // mark host dead and retry against next one
-            onFailure(node);
+            onFailure(node, responseTimeNanos, responseException);
             return new ResponseOrResponseException(responseException);
         }
         // mark host alive and don't retry, as the error should be a request problem
-        onResponse(node);
+        onResponse(node, responseTimeNanos, statusCode);
         throw responseException;
     }
 
@@ -408,13 +414,15 @@ public class Rest5Client implements Closeable {
         request.cancellable.runIfNotCancelled(() -> {
             final RequestContext context;
             context = request.createContextForNextAttempt(nodes.next());
+            final long startTimeNanos = System.nanoTime();
             Future<ClassicHttpResponse> futureRef = client.execute(context.requestProducer, context.asyncResponseConsumer, context.context,
                 new FutureCallback<ClassicHttpResponse>() {
                     @Override
                     public void completed(ClassicHttpResponse httpResponse) {
                         try {
+                            long responseTimeNanos = System.nanoTime() - startTimeNanos;
                             ResponseOrResponseException responseOrResponseException = convertResponse(request,
-                                context.node, httpResponse);
+                                context.node, httpResponse, responseTimeNanos);
                             if (responseOrResponseException.responseException == null) {
                                 listener.onSuccess(responseOrResponseException.response);
                             } else {
@@ -433,9 +441,10 @@ public class Rest5Client implements Closeable {
                     @Override
                     public void failed(Exception failure) {
                         try {
+                            long responseTimeNanos = System.nanoTime() - startTimeNanos;
                             RequestLogger.logFailedRequest(logger, request.httpRequest, context.node,
                                 failure);
-                            onFailure(context.node);
+                            onFailure(context.node, responseTimeNanos, failure);
                             if (isRetryableException(failure) && nodes.hasNext()) {
                                 listener.trackFailure(failure);
                                 performRequestAsync(nodes, request, listener);
@@ -471,7 +480,7 @@ public class Rest5Client implements Closeable {
      */
     private Iterator<Node> nextNodes() throws IOException {
         List<Node> nodes = this.nodes;
-        return selectNodes(nodes, blacklist, lastNodeIndex, nodeSelector).iterator();
+        return routingStrategy.selectNodes(nodes, blacklist, lastNodeIndex, nodeSelector);
     }
 
     /**
@@ -554,18 +563,19 @@ public class Rest5Client implements Closeable {
      * Called after each successful request call.
      * Receives as an argument the host that was used for the successful request.
      */
-    private void onResponse(Node node) {
+    private void onResponse(Node node, long responseTimeNanos, int statusCode) {
         DeadHostState removedHost = this.blacklist.remove(node.getHost());
         if (logger.isDebugEnabled() && removedHost != null) {
             logger.debug("removed [" + node + "] from blacklist");
         }
+        routingStrategy.onRequestSuccess(node, responseTimeNanos, statusCode);
     }
 
     /**
      * Called after each failed attempt.
      * Receives as an argument the host that was used for the failed attempt.
      */
-    private void onFailure(Node node) {
+    private void onFailure(Node node, long responseTimeNanos, Exception exception) {
         DeadHostState previousDeadHostState = blacklist.putIfAbsent(
             node.getHost(),
             new DeadHostState(DeadHostState.DEFAULT_TIME_SUPPLIER)
@@ -582,6 +592,7 @@ public class Rest5Client implements Closeable {
             }
         }
         failureListener.onFailure(node);
+        routingStrategy.onRequestFailure(node, responseTimeNanos, exception);
     }
 
     @Override
