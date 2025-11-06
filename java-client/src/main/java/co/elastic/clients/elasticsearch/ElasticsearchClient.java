@@ -210,6 +210,28 @@ public class ElasticsearchClient extends ApiClient<ElasticsearchTransport, Elast
 		return new ElasticsearchClient(this.transport, transportOptions);
 	}
 
+	/**
+	 * Creates a new ElasticsearchClient with caching enabled using default cache configuration.
+	 *
+	 * @param transport The underlying transport to use
+	 * @return A new ElasticsearchClient with caching enabled
+	 */
+	public static ElasticsearchClient withCache(ElasticsearchTransport transport) {
+		return withCache(transport, co.elastic.clients.transport.cache.CacheConfig.DEFAULT);
+	}
+
+	/**
+	 * Creates a new ElasticsearchClient with caching enabled using the specified cache configuration.
+	 *
+	 * @param transport The underlying transport to use
+	 * @param cacheConfig The cache configuration to use
+	 * @return A new ElasticsearchClient with caching enabled
+	 */
+	public static ElasticsearchClient withCache(ElasticsearchTransport transport, co.elastic.clients.transport.cache.CacheConfig cacheConfig) {
+		co.elastic.clients.transport.Transport cacheTransport = new co.elastic.clients.transport.cache.CacheTransport(transport, cacheConfig);
+		return new ElasticsearchClient(cacheTransport);
+	}
+
 	// ----- Child clients
 
 	public ElasticsearchAsyncSearchClient asyncSearch() {
