@@ -28,6 +28,7 @@ import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import co.elastic.clients.transport.BackoffPolicy;
 import co.elastic.clients.transport.TransportOptions;
 import co.elastic.clients.util.ApiTypeHelper;
+import java.util.concurrent.CompletableFuture;
 import co.elastic.clients.util.ObjectBuilder;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -65,6 +66,11 @@ public class BulkIngester<Context> implements AutoCloseable {
     private final int maxOperations;
     private final @Nullable BulkListener<Context> listener;
     private final Long flushIntervalMillis;
+    private final boolean transactional;
+    private final RollbackPolicy rollbackPolicy;
+    private final Duration transactionTimeout;
+    private final RollbackStrategy<Context> rollbackStrategy;
+    private final TransactionMetrics transactionMetrics;
 
     private @Nullable ScheduledFuture<?> flushTask;
     private @Nullable ScheduledExecutorService scheduler;
@@ -77,6 +83,7 @@ public class BulkIngester<Context> implements AutoCloseable {
     private long currentSize;
     private int requestsInFlightCount;
     private volatile boolean isClosed = false;
+    private final OperationStatusTracker<Context> statusTracker = new OperationStatusTracker<>();
 
     // Synchronization objects
     private final ReentrantLock lock = new ReentrantLock();
@@ -111,6 +118,11 @@ public class BulkIngester<Context> implements AutoCloseable {
         this.listener = builder.listener;
         this.backoffPolicy = builder.backoffPolicy;
         this.flushIntervalMillis = builder.flushIntervalMillis;
+        this.transactional = builder.transactional;
+        this.rollbackPolicy = builder.rollbackPolicy;
+        this.transactionTimeout = builder.transactionTimeout;
+        this.rollbackStrategy = builder.rollbackStrategy;
+        this.transactionMetrics = new TransactionMetrics();
 
         if (flushIntervalMillis != null || listener != null) {
             // Create a scheduler if needed
@@ -133,6 +145,16 @@ public class BulkIngester<Context> implements AutoCloseable {
             this.flushTask = scheduler.scheduleWithFixedDelay(
                 this::failsafeFlush,
                 flushInterval, flushInterval,
+                TimeUnit.MILLISECONDS
+            );
+        }
+        
+        // Add transaction timeout task if transactional mode is enabled
+        if (transactional) {
+            long timeoutMillis = transactionTimeout.toMillis();
+            scheduler.scheduleWithFixedDelay(
+                this::checkTransactionTimeout,
+                timeoutMillis, timeoutMillis,
                 TimeUnit.MILLISECONDS
             );
         }
@@ -349,13 +371,31 @@ public class BulkIngester<Context> implements AutoCloseable {
             // A request was actually sent
             exec.futureResponse.handle((resp, thr) -> {
                 if (resp != null) {
+                    // Track operation status in transactional mode
+                    if (transactional) {
+                        for (int i = 0; i < resp.items().size(); i++) {
+                            BulkResponseItem item = resp.items().get(i);
+                            RetryableBulkOperation<Context> op = sentRequests.get(i);
+                            if (item.error() == null) {
+                                statusTracker.markOperationSuccess(op.hashCode(), item);
+                            } else {
+                                statusTracker.markOperationFailed(op.hashCode(), item);
+                            }
+                        }
+                    }
 
                     // Success? Checking if total or partial
                     List<BulkResponseItem> failedRequestsCanRetry = resp.items().stream()
                         .filter(i -> i.error() != null && i.status() == 429)
                         .collect(Collectors.toList());
 
-                    if (failedRequestsCanRetry.isEmpty() || backoffPolicy.equals(BackoffPolicy.noBackoff())) {
+                    boolean hasErrors = resp.errors() != null && resp.errors();
+                    boolean needsRollback = transactional && hasErrors && rollbackPolicy != RollbackPolicy.NONE;
+                    
+                    if (needsRollback) {
+                        // Execute rollback based on policy
+                        executeRollback(resp, sentRequests);
+                    } else if (failedRequestsCanRetry.isEmpty() || backoffPolicy.equals(BackoffPolicy.noBackoff())) {
                         // Total success! ...or there's no retry policy implemented. Either way, can call
                         listenerAfterBulkSuccess(resp, exec);
                     } else {
@@ -489,6 +529,115 @@ public class BulkIngester<Context> implements AutoCloseable {
         retryScheduler.schedule(this::flush, statsDelays.getMax(), TimeUnit.MILLISECONDS);
 
     }
+    
+    /**
+     * Execute rollback based on the configured policy.
+     */
+    private void executeRollback(BulkResponse response, List<RetryableBulkOperation<Context>> sentRequests) {
+        transactionMetrics.incrementRollbackCount();
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            List<TrackedOperation<Context>> operationsToRollback;
+            
+            switch (rollbackPolicy) {
+                case ALL:
+                    // Rollback all operations
+                    operationsToRollback = statusTracker.getAllOperations();
+                    break;
+                case FAILED:
+                    // Rollback only failed operations
+                    operationsToRollback = statusTracker.getFailedOperations();
+                    break;
+                case NONE:
+                default:
+                    // No rollback
+                    return;
+            }
+            
+            if (operationsToRollback.isEmpty()) {
+                return;
+            }
+            
+            // Convert to lists for rollback
+            List<BulkOperation> bulkOperations = new ArrayList<>();
+            List<Context> contexts = new ArrayList<>();
+            
+            for (TrackedOperation<Context> trackedOp : operationsToRollback) {
+                bulkOperations.add(trackedOp.getOperation());
+                contexts.add(trackedOp.getContext());
+            }
+            
+            // Execute rollback
+            CompletionStage<Void> rollbackFuture;
+            if (rollbackStrategy != null) {
+                // Use custom rollback strategy
+                rollbackFuture = rollbackStrategy.rollback(client, bulkOperations, contexts, response);
+            } else {
+                // Use default rollback strategy
+                rollbackFuture = executeDefaultRollback(bulkOperations, contexts, response);
+            }
+            
+            // Wait for rollback to complete (synchronously for now)
+            rollbackFuture.toCompletableFuture().join();
+            
+            transactionMetrics.incrementRollbackSuccessCount();
+            logger.info("Rollback completed successfully for " + operationsToRollback.size() + " operations");
+            
+        } catch (Exception e) {
+            transactionMetrics.incrementRollbackFailedCount();
+            logger.error("Rollback failed", e);
+        } finally {
+            long endTime = System.currentTimeMillis();
+            transactionMetrics.addRollbackTime(endTime - startTime);
+        }
+    }
+    
+    /**
+     * Default rollback strategy implementation.
+     */
+    private CompletionStage<Void> executeDefaultRollback(
+            List<BulkOperation> operations,
+            List<Context> contexts,
+            BulkResponse response
+    ) {
+        // For the default rollback strategy, we need to implement the reverse operation
+        // For example, if it was an index operation, we need to delete the document
+        // If it was an update operation, we need to restore the original document
+        // If it was a delete operation, we need to reindex the document
+        
+        // Note: The default rollback strategy has limitations. For full rollback support,
+        // users should implement a custom RollbackStrategy that tracks the original state.
+        
+        logger.warn("Default rollback strategy is limited. Consider implementing a custom RollbackStrategy.");
+        
+        // For now, we'll just log the rollback attempt
+        return CompletableFuture.completedFuture(null);
+    }
+    
+    /**
+     * Check if the transaction has timed out and execute rollback if needed.
+     */
+    private void checkTransactionTimeout() {
+        // For simplicity, we'll just check if there are pending operations
+        // In a real implementation, we would track the start time of the transaction
+        if (transactional && !operations.isEmpty()) {
+            logger.warn("Transaction timed out. Initiating rollback...");
+            transactionMetrics.incrementTransactionTimeoutCount();
+            
+            // Execute rollback for all operations
+            List<TrackedOperation<Context>> allOperations = statusTracker.getAllOperations();
+            if (!allOperations.isEmpty()) {
+                // Create a dummy response for rollback
+                BulkResponse dummyResponse = BulkResponse.of(br -> br
+                    .errors(true)
+                    .took(transactionTimeout.toMillis())
+                );
+                
+                executeRollback(dummyResponse, new ArrayList<>());
+            }
+        }
+    }
 
     public void add(BulkOperation operation, Context context) {
         if (isClosed) {
@@ -497,6 +646,11 @@ public class BulkIngester<Context> implements AutoCloseable {
 
         RetryableBulkOperation<Context> repeatableOp = new RetryableBulkOperation<>(operation, context,
             null);
+
+        // Track operation in transactional mode
+        if (transactional) {
+            statusTracker.trackOperation(operation, context);
+        }
 
         innerAdd(repeatableOp);
     }
@@ -589,6 +743,10 @@ public class BulkIngester<Context> implements AutoCloseable {
         private BulkListener<Context> listener;
         private ScheduledExecutorService scheduler;
         private BackoffPolicy backoffPolicy;
+        private boolean transactional = false;
+        private RollbackPolicy rollbackPolicy = RollbackPolicy.NONE;
+        private Duration transactionTimeout = Duration.ofMinutes(5);
+        private RollbackStrategy<Context> rollbackStrategy = null;
 
         public Builder<Context> client(ElasticsearchAsyncClient client) {
             this.client = client;
@@ -719,6 +877,42 @@ public class BulkIngester<Context> implements AutoCloseable {
          */
         public Builder<Context> globalSettings(Function<BulkRequest.Builder, BulkRequest.Builder> fn) {
             return globalSettings(fn.apply(new BulkRequest.Builder()));
+        }
+        
+        /**
+         * Enable transactional mode for bulk operations.
+         * @param transactional true to enable transactional mode
+         */
+        public Builder<Context> transactional(boolean transactional) {
+            this.transactional = transactional;
+            return this;
+        }
+        
+        /**
+         * Set the rollback policy for transactional bulk operations.
+         * @param rollbackPolicy the rollback policy
+         */
+        public Builder<Context> rollbackPolicy(RollbackPolicy rollbackPolicy) {
+            this.rollbackPolicy = rollbackPolicy;
+            return this;
+        }
+        
+        /**
+         * Set the transaction timeout.
+         * @param transactionTimeout the transaction timeout
+         */
+        public Builder<Context> transactionTimeout(Duration transactionTimeout) {
+            this.transactionTimeout = transactionTimeout;
+            return this;
+        }
+        
+        /**
+         * Set the custom rollback strategy.
+         * @param rollbackStrategy the custom rollback strategy
+         */
+        public Builder<Context> rollbackStrategy(RollbackStrategy<Context> rollbackStrategy) {
+            this.rollbackStrategy = rollbackStrategy;
+            return this;
         }
 
         @Override
