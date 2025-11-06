@@ -26,24 +26,31 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Base class for object builders.
  */
 public class ObjectBuilderBase {
     private boolean _used = false;
+    private final ReentrantLock lock = new ReentrantLock(true); // Fair lock to prevent starvation
 
     protected void _checkSingleUse() {
-        if (this._used) {
-            throw new IllegalStateException("Object builders can only be used once");
+        lock.lock();
+        try {
+            if (this._used) {
+                throw new IllegalStateException("Object builders can only be used once");
+            }
+            this._used = true;
+        } finally {
+            lock.unlock();
         }
-        this._used = true;
     }
 
     //----- List utilities
 
-    /** A private extension of ArrayList so that we can recognize our own creations */
-    static final class InternalList<T> extends ArrayList<T> {
+    /** A private extension of CopyOnWriteArrayList for thread-safe list operations */
+    static final class InternalList<T> extends java.util.concurrent.CopyOnWriteArrayList<T> {
         InternalList() {
         }
 
@@ -90,8 +97,8 @@ public class ObjectBuilderBase {
 
     //----- Map utilities
 
-    /** A private extension of HashMap so that we can recognize our own creations */
-    private static final class InternalMap<K, V> extends HashMap<K, V> {
+    /** A private extension of ConcurrentHashMap for thread-safe map operations */
+    private static final class InternalMap<K, V> extends java.util.concurrent.ConcurrentHashMap<K, V> {
         InternalMap() {
         }
 

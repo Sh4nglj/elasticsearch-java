@@ -305,7 +305,8 @@ public class BulkRequest extends RequestBase implements NdJsonpSerializable, Jso
 
 	@Override
 	public Iterator<?> _serializables() {
-		return this.operations.iterator();
+		// Return a copy of the operations list to avoid ConcurrentModificationException
+		return new ArrayList<>(this.operations).iterator();
 	}
 	/**
 	 * Indicates whether to return the <code>_source</code> field (<code>true</code>
