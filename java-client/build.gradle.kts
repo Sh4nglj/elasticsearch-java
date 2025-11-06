@@ -68,10 +68,10 @@ tasks.getByName<ProcessResources>("processResources") {
     eachFile {
         if (name != "apis.json") {
             // Only process main source-set resources (test files are large)
-            expand(
+            expand(mapOf(
                     "version" to version,
                     "git_revision" to (if (rootProject.extra.has("gitHashFull")) rootProject.extra["gitHashFull"] else "unknown")
-            )
+            ))
         }
     }
 }
